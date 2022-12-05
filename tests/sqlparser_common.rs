@@ -88,7 +88,9 @@ fn parse_insert_values() {
                     assert_eq!(column, &Ident::new(expected_columns[index].clone()));
                 }
                 match &*source.body {
-                    SetExpr::Values(Values(values)) => assert_eq!(values.as_slice(), expected_rows),
+                    SetExpr::Values(Values { rows, .. }) => {
+                        assert_eq!(rows.as_slice(), expected_rows)
+                    }
                     _ => unreachable!(),
                 }
             }
@@ -460,6 +462,7 @@ fn parse_top_level() {
     verified_stmt("(SELECT 1)");
     verified_stmt("((SELECT 1))");
     verified_stmt("VALUES (1)");
+    verified_stmt("VALUES ROW(1, true, 'a'), ROW(2, false, 'b')");
 }
 
 #[test]
@@ -578,22 +581,22 @@ fn parse_select_into() {
 fn parse_select_wildcard() {
     let sql = "SELECT * FROM foo";
     let select = verified_only_select(sql);
-    assert_eq!(&SelectItem::Wildcard, only(&select.projection));
+    assert_eq!(&SelectItem::Wildcard(None), only(&select.projection));
 
     let sql = "SELECT foo.* FROM foo";
     let select = verified_only_select(sql);
     assert_eq!(
-        &SelectItem::QualifiedWildcard(ObjectName(vec![Ident::new("foo")])),
+        &SelectItem::QualifiedWildcard(ObjectName(vec![Ident::new("foo")]), None),
         only(&select.projection)
     );
 
     let sql = "SELECT myschema.mytable.* FROM myschema.mytable";
     let select = verified_only_select(sql);
     assert_eq!(
-        &SelectItem::QualifiedWildcard(ObjectName(vec![
-            Ident::new("myschema"),
-            Ident::new("mytable"),
-        ])),
+        &SelectItem::QualifiedWildcard(
+            ObjectName(vec![Ident::new("myschema"), Ident::new("mytable"),]),
+            None
+        ),
         only(&select.projection)
     );
 
@@ -2271,6 +2274,55 @@ fn parse_create_table_as() {
 }
 
 #[test]
+fn parse_create_table_as_table() {
+    let sql1 = "CREATE TABLE new_table AS TABLE old_table";
+
+    let expected_query1 = Box::new(Query {
+        with: None,
+        body: Box::new(SetExpr::Table(Box::new(Table {
+            table_name: Some("old_table".to_string()),
+            schema_name: None,
+        }))),
+        order_by: vec![],
+        limit: None,
+        offset: None,
+        fetch: None,
+        lock: None,
+    });
+
+    match verified_stmt(sql1) {
+        Statement::CreateTable { query, name, .. } => {
+            assert_eq!(name, ObjectName(vec![Ident::new("new_table")]));
+            assert_eq!(query.unwrap(), expected_query1);
+        }
+        _ => unreachable!(),
+    }
+
+    let sql2 = "CREATE TABLE new_table AS TABLE schema_name.old_table";
+
+    let expected_query2 = Box::new(Query {
+        with: None,
+        body: Box::new(SetExpr::Table(Box::new(Table {
+            table_name: Some("old_table".to_string()),
+            schema_name: Some("schema_name".to_string()),
+        }))),
+        order_by: vec![],
+        limit: None,
+        offset: None,
+        fetch: None,
+        lock: None,
+    });
+
+    match verified_stmt(sql2) {
+        Statement::CreateTable { query, name, .. } => {
+            assert_eq!(name, ObjectName(vec![Ident::new("new_table")]));
+            assert_eq!(query.unwrap(), expected_query2);
+        }
+        _ => unreachable!(),
+    }
+}
+
+#[test]
 fn parse_create_table_on_cluster() {
     // Using single-quote literal to define current cluster
     let sql = "CREATE TABLE t ON CLUSTER '{cluster}' (a INT, b INT)";
@@ -2528,8 +2580,15 @@ fn parse_alter_table() {
     match one_statement_parses_to(add_column, "ALTER TABLE tab ADD COLUMN foo TEXT") {
         Statement::AlterTable {
             name,
-            operation: AlterTableOperation::AddColumn { column_def },
+            operation:
+                AlterTableOperation::AddColumn {
+                    column_keyword,
+                    if_not_exists,
+                    column_def,
+                },
         } => {
+            assert!(column_keyword);
+            assert!(!if_not_exists);
             assert_eq!("tab", name.to_string());
             assert_eq!("foo", column_def.name.to_string());
             assert_eq!("TEXT", column_def.data_type.to_string());
@@ -2565,6 +2624,66 @@ fn parse_alter_table() {
         }
         _ => unreachable!(),
     }
+}
+
+#[test]
+fn parse_alter_table_add_column() {
+    match verified_stmt("ALTER TABLE tab ADD foo TEXT") {
+        Statement::AlterTable {
+            operation: AlterTableOperation::AddColumn { column_keyword, .. },
+            ..
+        } => {
+            assert!(!column_keyword);
+        }
+        _ => unreachable!(),
+    };
+
+    match verified_stmt("ALTER TABLE tab ADD COLUMN foo TEXT") {
+        Statement::AlterTable {
+            operation: AlterTableOperation::AddColumn { column_keyword, .. },
+            ..
+        } => {
+            assert!(column_keyword);
+        }
+        _ => unreachable!(),
+    };
+}
+
+#[test]
+fn parse_alter_table_add_column_if_not_exists() {
+    let dialects = TestedDialects {
+        dialects: vec![
+            Box::new(PostgreSqlDialect {}),
+            Box::new(BigQueryDialect {}),
+            Box::new(GenericDialect {}),
+        ],
+    };
+
+    match dialects.verified_stmt("ALTER TABLE tab ADD IF NOT EXISTS foo TEXT") {
+        Statement::AlterTable {
+            operation: AlterTableOperation::AddColumn { if_not_exists, .. },
+            ..
+        } => {
+            assert!(if_not_exists);
+        }
+        _ => unreachable!(),
+    };
+
+    match dialects.verified_stmt("ALTER TABLE tab ADD COLUMN IF NOT EXISTS foo TEXT") {
+        Statement::AlterTable {
+            operation:
+                AlterTableOperation::AddColumn {
+                    column_keyword,
+                    if_not_exists,
+                    ..
+                },
+            ..
+        } => {
+            assert!(column_keyword);
+            assert!(if_not_exists);
+        }
+        _ => unreachable!(),
+    };
 }
 
 #[test]
@@ -3783,6 +3902,22 @@ fn parse_joins_on() {
         vec![join_with_constraint("t2", None, JoinOperator::RightOuter)]
     );
     assert_eq!(
+        only(&verified_only_select("SELECT * FROM t1 LEFT SEMI JOIN t2 ON c1 = c2").from).joins,
+        vec![join_with_constraint("t2", None, JoinOperator::LeftSemi)]
+    );
+    assert_eq!(
+        only(&verified_only_select("SELECT * FROM t1 RIGHT SEMI JOIN t2 ON c1 = c2").from).joins,
+        vec![join_with_constraint("t2", None, JoinOperator::RightSemi)]
+    );
+    assert_eq!(
+        only(&verified_only_select("SELECT * FROM t1 LEFT ANTI JOIN t2 ON c1 = c2").from).joins,
+        vec![join_with_constraint("t2", None, JoinOperator::LeftAnti)]
+    );
+    assert_eq!(
+        only(&verified_only_select("SELECT * FROM t1 RIGHT ANTI JOIN t2 ON c1 = c2").from).joins,
+        vec![join_with_constraint("t2", None, JoinOperator::RightAnti)]
+    );
+    assert_eq!(
         only(&verified_only_select("SELECT * FROM t1 FULL JOIN t2 ON c1 = c2").from).joins,
         vec![join_with_constraint("t2", None, JoinOperator::FullOuter)]
     );
@@ -3830,6 +3965,22 @@ fn parse_joins_using() {
     assert_eq!(
         only(&verified_only_select("SELECT * FROM t1 RIGHT JOIN t2 USING(c1)").from).joins,
         vec![join_with_constraint("t2", None, JoinOperator::RightOuter)]
+    );
+    assert_eq!(
+        only(&verified_only_select("SELECT * FROM t1 LEFT SEMI JOIN t2 USING(c1)").from).joins,
+        vec![join_with_constraint("t2", None, JoinOperator::LeftSemi)]
+    );
+    assert_eq!(
+        only(&verified_only_select("SELECT * FROM t1 RIGHT SEMI JOIN t2 USING(c1)").from).joins,
+        vec![join_with_constraint("t2", None, JoinOperator::RightSemi)]
+    );
+    assert_eq!(
+        only(&verified_only_select("SELECT * FROM t1 LEFT ANTI JOIN t2 USING(c1)").from).joins,
+        vec![join_with_constraint("t2", None, JoinOperator::LeftAnti)]
+    );
+    assert_eq!(
+        only(&verified_only_select("SELECT * FROM t1 RIGHT ANTI JOIN t2 USING(c1)").from).joins,
+        vec![join_with_constraint("t2", None, JoinOperator::RightAnti)]
     );
     assert_eq!(
         only(&verified_only_select("SELECT * FROM t1 FULL JOIN t2 USING(c1)").from).joins,
@@ -4150,6 +4301,7 @@ fn parse_values() {
     verified_stmt("SELECT * FROM (VALUES (1), (2), (3))");
     verified_stmt("SELECT * FROM (VALUES (1), (2), (3)), (VALUES (1, 2, 3))");
     verified_stmt("SELECT * FROM (VALUES (1)) UNION VALUES (1)");
+    verified_stmt("SELECT * FROM (VALUES ROW(1, true, 'a'), ROW(2, false, 'b')) AS t (a, b, c)");
 }
 
 #[test]
@@ -4378,6 +4530,7 @@ fn parse_create_view() {
             or_replace,
             materialized,
             with_options,
+            cluster_by,
         } => {
             assert_eq!("myschema.myview", name.to_string());
             assert_eq!(Vec::<Ident>::new(), columns);
@@ -4385,6 +4538,7 @@ fn parse_create_view() {
             assert!(!materialized);
             assert!(!or_replace);
             assert_eq!(with_options, vec![]);
+            assert_eq!(cluster_by, vec![]);
         }
         _ => unreachable!(),
     }
@@ -4424,13 +4578,15 @@ fn parse_create_view_with_columns() {
             with_options,
             query,
             materialized,
+            cluster_by,
         } => {
             assert_eq!("v", name.to_string());
             assert_eq!(columns, vec![Ident::new("has"), Ident::new("cols")]);
             assert_eq!(with_options, vec![]);
             assert_eq!("SELECT 1, 2", query.to_string());
             assert!(!materialized);
-            assert!(!or_replace)
+            assert!(!or_replace);
+            assert_eq!(cluster_by, vec![]);
         }
         _ => unreachable!(),
     }
@@ -4447,13 +4603,15 @@ fn parse_create_or_replace_view() {
             with_options,
             query,
             materialized,
+            cluster_by,
         } => {
             assert_eq!("v", name.to_string());
             assert_eq!(columns, vec![]);
             assert_eq!(with_options, vec![]);
             assert_eq!("SELECT 1", query.to_string());
             assert!(!materialized);
-            assert!(or_replace)
+            assert!(or_replace);
+            assert_eq!(cluster_by, vec![]);
         }
         _ => unreachable!(),
     }
@@ -4474,13 +4632,15 @@ fn parse_create_or_replace_materialized_view() {
             with_options,
             query,
             materialized,
+            cluster_by,
         } => {
             assert_eq!("v", name.to_string());
             assert_eq!(columns, vec![]);
             assert_eq!(with_options, vec![]);
             assert_eq!("SELECT 1", query.to_string());
             assert!(materialized);
-            assert!(or_replace)
+            assert!(or_replace);
+            assert_eq!(cluster_by, vec![]);
         }
         _ => unreachable!(),
     }
@@ -4497,6 +4657,7 @@ fn parse_create_materialized_view() {
             query,
             materialized,
             with_options,
+            cluster_by,
         } => {
             assert_eq!("myschema.myview", name.to_string());
             assert_eq!(Vec::<Ident>::new(), columns);
@@ -4504,6 +4665,32 @@ fn parse_create_materialized_view() {
             assert!(materialized);
             assert_eq!(with_options, vec![]);
             assert!(!or_replace);
+            assert_eq!(cluster_by, vec![]);
+        }
+        _ => unreachable!(),
+    }
+}
+
+#[test]
+fn parse_create_materialized_view_with_cluster_by() {
+    let sql = "CREATE MATERIALIZED VIEW myschema.myview CLUSTER BY (foo) AS SELECT foo FROM bar";
+    match verified_stmt(sql) {
+        Statement::CreateView {
+            name,
+            or_replace,
+            columns,
+            query,
+            materialized,
+            with_options,
+            cluster_by,
+        } => {
+            assert_eq!("myschema.myview", name.to_string());
+            assert_eq!(Vec::<Ident>::new(), columns);
+            assert_eq!("SELECT foo FROM bar", query.to_string());
+            assert!(materialized);
+            assert_eq!(with_options, vec![]);
+            assert!(!or_replace);
+            assert_eq!(cluster_by, vec![Ident::new("foo")]);
         }
         _ => unreachable!(),
     }
@@ -4961,6 +5148,17 @@ fn parse_set_time_zone() {
 }
 
 #[test]
+fn parse_set_time_zone_alias() {
+    match verified_stmt("SET TIME ZONE 'UTC'") {
+        Statement::SetTimeZone { local, value } => {
+            assert!(!local);
+            assert_eq!(value, Expr::Value(Value::SingleQuotedString("UTC".into())));
+        }
+        _ => unreachable!(),
+    }
+}
+
+#[test]
 fn parse_commit() {
     match verified_stmt("COMMIT") {
         Statement::Commit { chain: false } => (),
@@ -5033,9 +5231,45 @@ fn parse_create_index() {
             columns,
             unique,
             if_not_exists,
+            ..
         } => {
             assert_eq!("idx_name", name.to_string());
             assert_eq!("test", table_name.to_string());
+            assert_eq!(indexed_columns, columns);
+            assert!(unique);
+            assert!(if_not_exists)
+        }
+        _ => unreachable!(),
+    }
+}
+
+#[test]
+fn test_create_index_with_using_function() {
+    let sql = "CREATE UNIQUE INDEX IF NOT EXISTS idx_name ON test USING btree (name,age DESC)";
+    let indexed_columns = vec![
+        OrderByExpr {
+            expr: Expr::Identifier(Ident::new("name")),
+            asc: None,
+            nulls_first: None,
+        },
+        OrderByExpr {
+            expr: Expr::Identifier(Ident::new("age")),
+            asc: Some(false),
+            nulls_first: None,
+        },
+    ];
+    match verified_stmt(sql) {
+        Statement::CreateIndex {
+            name,
+            table_name,
+            using,
+            columns,
+            unique,
+            if_not_exists,
+        } => {
+            assert_eq!("idx_name", name.to_string());
+            assert_eq!("test", table_name.to_string());
+            assert_eq!("btree", using.unwrap().to_string());
             assert_eq!(indexed_columns, columns);
             assert!(unique);
             assert!(if_not_exists)
@@ -5335,7 +5569,7 @@ fn parse_merge() {
                         body: Box::new(SetExpr::Select(Box::new(Select {
                             distinct: false,
                             top: None,
-                            projection: vec![SelectItem::Wildcard],
+                            projection: vec![SelectItem::Wildcard(None)],
                             into: None,
                             from: vec![TableWithJoins {
                                 relation: TableFactor::Table {
@@ -5408,11 +5642,14 @@ fn parse_merge() {
                     MergeClause::NotMatched {
                         predicate: None,
                         columns: vec![Ident::new("A"), Ident::new("B"), Ident::new("C")],
-                        values: Values(vec![vec![
-                            Expr::CompoundIdentifier(vec![Ident::new("stg"), Ident::new("A")]),
-                            Expr::CompoundIdentifier(vec![Ident::new("stg"), Ident::new("B")]),
-                            Expr::CompoundIdentifier(vec![Ident::new("stg"), Ident::new("C")]),
-                        ]]),
+                        values: Values {
+                            explicit_row: false,
+                            rows: vec![vec![
+                                Expr::CompoundIdentifier(vec![Ident::new("stg"), Ident::new("A")]),
+                                Expr::CompoundIdentifier(vec![Ident::new("stg"), Ident::new("B")]),
+                                Expr::CompoundIdentifier(vec![Ident::new("stg"), Ident::new("C")]),
+                            ]]
+                        },
                     },
                     MergeClause::MatchedUpdate {
                         predicate: Some(Expr::BinaryOp {

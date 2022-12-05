@@ -1067,7 +1067,9 @@ fn parse_prepare() {
                 Expr::Identifier("a3".into()),
             ]];
             match &*source.body {
-                SetExpr::Values(Values(values)) => assert_eq!(values.as_slice(), &expected_values),
+                SetExpr::Values(Values { rows, .. }) => {
+                    assert_eq!(rows.as_slice(), &expected_values)
+                }
                 _ => unreachable!(),
             }
         }
@@ -1117,10 +1119,13 @@ fn parse_pg_on_conflict() {
         } => {
             assert_eq!(vec![Ident::from("did")], conflict_target);
             assert_eq!(
-                OnConflictAction::DoUpdate(vec![Assignment {
-                    id: vec!["dname".into()],
-                    value: Expr::CompoundIdentifier(vec!["EXCLUDED".into(), "dname".into()])
-                },]),
+                OnConflictAction::DoUpdate(DoUpdate {
+                    assignments: vec![Assignment {
+                        id: vec!["dname".into()],
+                        value: Expr::CompoundIdentifier(vec!["EXCLUDED".into(), "dname".into()])
+                    },],
+                    selection: None
+                }),
                 action
             );
         }
@@ -1147,16 +1152,22 @@ fn parse_pg_on_conflict() {
                 conflict_target
             );
             assert_eq!(
-                OnConflictAction::DoUpdate(vec![
-                    Assignment {
-                        id: vec!["dname".into()],
-                        value: Expr::CompoundIdentifier(vec!["EXCLUDED".into(), "dname".into()])
-                    },
-                    Assignment {
-                        id: vec!["area".into()],
-                        value: Expr::CompoundIdentifier(vec!["EXCLUDED".into(), "area".into()])
-                    },
-                ]),
+                OnConflictAction::DoUpdate(DoUpdate {
+                    assignments: vec![
+                        Assignment {
+                            id: vec!["dname".into()],
+                            value: Expr::CompoundIdentifier(vec![
+                                "EXCLUDED".into(),
+                                "dname".into()
+                            ])
+                        },
+                        Assignment {
+                            id: vec!["area".into()],
+                            value: Expr::CompoundIdentifier(vec!["EXCLUDED".into(), "area".into()])
+                        },
+                    ],
+                    selection: None
+                }),
                 action
             );
         }
@@ -1179,6 +1190,43 @@ fn parse_pg_on_conflict() {
         } => {
             assert_eq!(Vec::<Ident>::new(), conflict_target);
             assert_eq!(OnConflictAction::DoNothing, action);
+        }
+        _ => unreachable!(),
+    };
+
+    let stmt = pg_and_generic().verified_stmt(
+        "INSERT INTO distributors (did, dname, dsize) \
+        VALUES (5, 'Gizmo Transglobal', 1000), (6, 'Associated Computing, Inc', 1010)  \
+        ON CONFLICT(did) \
+        DO UPDATE SET dname = $1 WHERE dsize > $2",
+    );
+    match stmt {
+        Statement::Insert {
+            on:
+                Some(OnInsert::OnConflict(OnConflict {
+                    conflict_target,
+                    action,
+                })),
+            ..
+        } => {
+            assert_eq!(vec![Ident::from("did")], conflict_target);
+            assert_eq!(
+                OnConflictAction::DoUpdate(DoUpdate {
+                    assignments: vec![Assignment {
+                        id: vec!["dname".into()],
+                        value: Expr::Value(Value::Placeholder("$1".to_string()))
+                    },],
+                    selection: Some(Expr::BinaryOp {
+                        left: Box::new(Expr::Identifier(Ident {
+                            value: "dsize".to_string(),
+                            quote_style: None
+                        })),
+                        op: BinaryOperator::Gt,
+                        right: Box::new(Expr::Value(Value::Placeholder("$2".to_string())))
+                    })
+                }),
+                action
+            );
         }
         _ => unreachable!(),
     };
@@ -1229,7 +1277,7 @@ fn parse_pg_returning() {
         pg_and_generic().verified_stmt("DELETE FROM tasks WHERE status = 'DONE' RETURNING *");
     match stmt {
         Statement::Delete { returning, .. } => {
-            assert_eq!(Some(vec![SelectItem::Wildcard,]), returning);
+            assert_eq!(Some(vec![SelectItem::Wildcard(None),]), returning);
         }
         _ => unreachable!(),
     };
@@ -1271,7 +1319,7 @@ fn parse_pg_unary_ops() {
         let select = pg().verified_only_select(&format!("SELECT {}a", &str_op));
         assert_eq!(
             SelectItem::UnnamedExpr(Expr::UnaryOp {
-                op: op.clone(),
+                op: *op,
                 expr: Box::new(Expr::Identifier(Ident::new("a"))),
             }),
             select.projection[0]
@@ -1287,7 +1335,7 @@ fn parse_pg_postfix_factorial() {
         let select = pg().verified_only_select(&format!("SELECT a{}", &str_op));
         assert_eq!(
             SelectItem::UnnamedExpr(Expr::UnaryOp {
-                op: op.clone(),
+                op: *op,
                 expr: Box::new(Expr::Identifier(Ident::new("a"))),
             }),
             select.projection[0]
@@ -2185,4 +2233,58 @@ fn parse_similar_to() {
     }
     chk(false);
     chk(true);
+}
+
+#[test]
+fn parse_create_function() {
+    let sql = "CREATE FUNCTION add(INTEGER, INTEGER) RETURNS INTEGER LANGUAGE SQL IMMUTABLE AS 'select $1 + $2;'";
+    assert_eq!(
+        pg().verified_stmt(sql),
+        Statement::CreateFunction {
+            or_replace: false,
+            temporary: false,
+            name: ObjectName(vec![Ident::new("add")]),
+            args: Some(vec![
+                CreateFunctionArg::unnamed(DataType::Integer(None)),
+                CreateFunctionArg::unnamed(DataType::Integer(None)),
+            ]),
+            return_type: Some(DataType::Integer(None)),
+            params: CreateFunctionBody {
+                language: Some("SQL".into()),
+                behavior: Some(FunctionBehavior::Immutable),
+                as_: Some("select $1 + $2;".into()),
+                ..Default::default()
+            },
+        }
+    );
+
+    let sql = "CREATE OR REPLACE FUNCTION add(a INTEGER, IN b INTEGER = 1) RETURNS INTEGER LANGUAGE SQL IMMUTABLE RETURN a + b";
+    assert_eq!(
+        pg().verified_stmt(sql),
+        Statement::CreateFunction {
+            or_replace: true,
+            temporary: false,
+            name: ObjectName(vec![Ident::new("add")]),
+            args: Some(vec![
+                CreateFunctionArg::with_name("a", DataType::Integer(None)),
+                CreateFunctionArg {
+                    mode: Some(ArgMode::In),
+                    name: Some("b".into()),
+                    data_type: DataType::Integer(None),
+                    default_expr: Some(Expr::Value(Value::Number("1".parse().unwrap(), false))),
+                }
+            ]),
+            return_type: Some(DataType::Integer(None)),
+            params: CreateFunctionBody {
+                language: Some("SQL".into()),
+                behavior: Some(FunctionBehavior::Immutable),
+                return_: Some(Expr::BinaryOp {
+                    left: Box::new(Expr::Identifier("a".into())),
+                    op: BinaryOperator::Plus,
+                    right: Box::new(Expr::Identifier("b".into())),
+                }),
+                ..Default::default()
+            },
+        }
+    );
 }

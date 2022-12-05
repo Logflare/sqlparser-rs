@@ -211,7 +211,7 @@ fn parse_show_create() {
         assert_eq!(
             mysql_and_generic().verified_stmt(format!("SHOW CREATE {} myident", obj_type).as_str()),
             Statement::ShowCreate {
-                obj_type: obj_type.clone(),
+                obj_type: *obj_type,
                 obj_name: obj_name.clone(),
             }
         );
@@ -660,20 +660,25 @@ fn parse_simple_insert() {
             assert_eq!(
                 Box::new(Query {
                     with: None,
-                    body: Box::new(SetExpr::Values(Values(vec![
-                        vec![
-                            Expr::Value(Value::SingleQuotedString("Test Some Inserts".to_string())),
-                            Expr::Value(Value::Number("1".to_string(), false))
-                        ],
-                        vec![
-                            Expr::Value(Value::SingleQuotedString("Test Entry 2".to_string())),
-                            Expr::Value(Value::Number("2".to_string(), false))
-                        ],
-                        vec![
-                            Expr::Value(Value::SingleQuotedString("Test Entry 3".to_string())),
-                            Expr::Value(Value::Number("3".to_string(), false))
+                    body: Box::new(SetExpr::Values(Values {
+                        explicit_row: false,
+                        rows: vec![
+                            vec![
+                                Expr::Value(Value::SingleQuotedString(
+                                    "Test Some Inserts".to_string()
+                                )),
+                                Expr::Value(Value::Number("1".to_string(), false))
+                            ],
+                            vec![
+                                Expr::Value(Value::SingleQuotedString("Test Entry 2".to_string())),
+                                Expr::Value(Value::Number("2".to_string(), false))
+                            ],
+                            vec![
+                                Expr::Value(Value::SingleQuotedString("Test Entry 3".to_string())),
+                                Expr::Value(Value::Number("3".to_string(), false))
+                            ]
                         ]
-                    ]))),
+                    })),
                     order_by: vec![],
                     limit: None,
                     offset: None,
@@ -717,16 +722,21 @@ fn parse_insert_with_on_duplicate_update() {
             assert_eq!(
                 Box::new(Query {
                     with: None,
-                    body: Box::new(SetExpr::Values(Values(vec![vec![
-                        Expr::Value(Value::SingleQuotedString("accounting_manager".to_string())),
-                        Expr::Value(Value::SingleQuotedString(
-                            "Some description about the group".to_string()
-                        )),
-                        Expr::Value(Value::Boolean(true)),
-                        Expr::Value(Value::Boolean(true)),
-                        Expr::Value(Value::Boolean(true)),
-                        Expr::Value(Value::Boolean(true)),
-                    ]]))),
+                    body: Box::new(SetExpr::Values(Values {
+                        explicit_row: false,
+                        rows: vec![vec![
+                            Expr::Value(Value::SingleQuotedString(
+                                "accounting_manager".to_string()
+                            )),
+                            Expr::Value(Value::SingleQuotedString(
+                                "Some description about the group".to_string()
+                            )),
+                            Expr::Value(Value::Boolean(true)),
+                            Expr::Value(Value::Boolean(true)),
+                            Expr::Value(Value::Boolean(true)),
+                            Expr::Value(Value::Boolean(true)),
+                        ]]
+                    })),
                     order_by: vec![],
                     limit: None,
                     offset: None,
@@ -1167,6 +1177,32 @@ fn parse_create_table_with_spatial_definition() {
 }
 
 #[test]
+fn parse_fulltext_expression() {
+    mysql_and_generic().verified_stmt("SELECT * FROM tb WHERE MATCH (c1) AGAINST ('string')");
+
+    mysql_and_generic().verified_stmt(
+        "SELECT * FROM tb WHERE MATCH (c1) AGAINST ('string' IN NATURAL LANGUAGE MODE)",
+    );
+
+    mysql_and_generic().verified_stmt("SELECT * FROM tb WHERE MATCH (c1) AGAINST ('string' IN NATURAL LANGUAGE MODE WITH QUERY EXPANSION)");
+
+    mysql_and_generic()
+        .verified_stmt("SELECT * FROM tb WHERE MATCH (c1) AGAINST ('string' IN BOOLEAN MODE)");
+
+    mysql_and_generic()
+        .verified_stmt("SELECT * FROM tb WHERE MATCH (c1) AGAINST ('string' WITH QUERY EXPANSION)");
+
+    mysql_and_generic()
+        .verified_stmt("SELECT * FROM tb WHERE MATCH (c1, c2, c3) AGAINST ('string')");
+
+    mysql_and_generic().verified_stmt("SELECT * FROM tb WHERE MATCH (c1) AGAINST (123)");
+
+    mysql_and_generic().verified_stmt("SELECT * FROM tb WHERE MATCH (c1) AGAINST (NULL)");
+
+    mysql_and_generic().verified_stmt("SELECT COUNT(IF(MATCH (title, body) AGAINST ('database' IN NATURAL LANGUAGE MODE), 1, NULL)) AS count FROM articles");
+}
+
+#[test]
 #[should_panic = "Expected FULLTEXT or SPATIAL option without constraint name, found: cons"]
 fn parse_create_table_with_fulltext_definition_should_not_accept_constraint_name() {
     mysql_and_generic().verified_stmt("CREATE TABLE tb (c1 INT, CONSTRAINT cons FULLTEXT (c1))");
@@ -1182,4 +1218,10 @@ fn mysql_and_generic() -> TestedDialects {
     TestedDialects {
         dialects: vec![Box::new(MySqlDialect {}), Box::new(GenericDialect {})],
     }
+}
+
+#[test]
+fn parse_values() {
+    mysql().verified_stmt("VALUES ROW(1, true, 'a')");
+    mysql().verified_stmt("SELECT a, c FROM (VALUES ROW(1, true, 'a'), ROW(2, false, 'b'), ROW(3, false, 'c')) AS t (a, b, c)");
 }
